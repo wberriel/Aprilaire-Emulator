@@ -1,0 +1,730 @@
+/*******************************************************************************************
+  SIMPL+ Module Information
+
+*******************************************************************************************/
+/*
+Programmer: William Berriel
+Copyright: 2/17/2017 by William Berriel.
+License: This is released under the BSD license. Feel Free to copy and use as you wish. */
+
+/*******************************************************************************************
+  Compiler Directives
+  (Uncomment and declare compiler directives as needed)
+*******************************************************************************************/
+// #ENABLE_DYNAMIC
+// #SYMBOL_NAME ""
+// #HINT ""
+// #DEFINE_CONSTANT
+#DEFINE_CONSTANT	LINE_DELIM		"\x0D"
+#DEFINE_CONSTANT	COMMAND_START	"SN"
+#DEFINE_CONSTANT	COMMAND_ALL_A	"SN "
+#DEFINE_CONSTANT	COMMAND_ALL_B	"SN0"
+#DEFINE_CONSTANT	COMMAND_SPACE	" "
+#DEFINE_CONSTANT	BUFFER_INPUT_SIZE	768 // 3 * max buffer size apparently.
+#DEFINE_CONSTANT	MODE_OFF	"OFF"
+#DEFINE_CONSTANT	M_OFF		"O"
+#DEFINE_CONSTANT	MODE_HEAT	"HEAT"
+#DEFINE_CONSTANT	M_HEAT		"H"
+#DEFINE_CONSTANT	MODE_COOL	"COOL"
+#DEFINE_CONSTANT	M_COOL		"C"
+#DEFINE_CONSTANT	MODE_EHEAT	"EMHT"
+#DEFINE_CONSTANT	M_EHEAT		"E"
+#DEFINE_CONSTANT	MODE_AUTO	"AUTO"
+#DEFINE_CONSTANT	M_AUTO		"A"
+#DEFINE_CONSTANT	MODE_ON		"ON"
+#DEFINE_CONSTANT	MODE_HUMID	"HUMID"
+#DEFINE_CONSTANT	MODE_DEHUMID	"DEHUMID"
+#DEFINE_CONSTANT 	FMODE_ON	"ON"
+#DEFINE_CONSTANT 	FMODE_AUTO	"AUTO"
+#DEFINE_CONSTANT	PULSE_TIME	10
+
+#DEFAULT_VOLATILE
+#ENABLE_STACK_CHECKING
+#ENABLE_TRACE
+/*
+#HELP_BEGIN
+   (add additional lines of help lines)
+#HELP_END
+*/
+
+/*******************************************************************************************
+  DIGITAL, ANALOG and SERIAL INPUTS and OUTPUTS
+  (Uncomment and declare inputs and outputs as needed)
+*******************************************************************************************/
+DIGITAL_INPUT in_mode_off,in_mode_heat,in_mode_cool,in_mode_auto,in_mode_eheat,in_fmode_auto,in_fmode_on,
+			  in_heat_on, in_cool_on;
+ANALOG_INPUT in_setpoint_heat,in_setpoint_cool,in_hum_setpoint,in_temperature,in_humidity;
+// STRING_INPUT 
+BUFFER_INPUT telnet_input[1000];
+
+DIGITAL_OUTPUT out_mode_off,out_mode_heat,out_mode_cool,out_mode_auto,out_mode_eheat,out_fmode_auto,out_fmode_on;
+ANALOG_OUTPUT out_setpoint_heat,out_setpoint_cool,out_hum_setpoint;
+STRING_OUTPUT telnet_output;
+
+/*******************************************************************************************
+  Parameters
+  (Uncomment and declare parameters as needed)
+*******************************************************************************************/
+INTEGER_PARAMETER tstat_number;
+
+/*******************************************************************************************
+  Parameter Properties
+  (Uncomment and declare parameter properties as needed)
+*******************************************************************************************/
+
+#BEGIN_PARAMETER_PROPERTIES tstat_number   
+	propValidUnits = unitDecimal;
+   	propDefaultUnit = unitDecimal;
+   	propBounds = 1d , 64d;
+   	propDefaultValue = 1d;  
+  	propShortDescription = "The number that savant will use to refer to the tstat. Between 1 and 64.";
+#END_PARAMETER_PROPERTIES
+
+
+/*******************************************************************************************
+  Structure Definitions
+  (Uncomment and define structure definitions as needed)
+  Note:  Be sure to initialize all declared STRING variables as needed
+         For example, in Function Main: struct.myString = "";
+*******************************************************************************************/
+STRUCTURE TSTAT_STATE
+{
+	// all temps are stored internally in Fahrenheit.
+	INTEGER HeatSetPoint;
+	INTEGER CoolSetPoint;
+	INTEGER HumSetPoint;
+	INTEGER Temperatue;
+	INTEGER Humidity;
+	STRING Mode[10];
+	STRING FMode[10];
+	// Valid values are F and C (for fahrenheit and Celcius)
+	STRING Output_Scale[1];
+};
+
+TSTAT_STATE current_state;
+
+/*******************************************************************************************
+  Global Variables
+  (Uncomment and declare global variables as needed)
+  Note:  Be sure to initialize all declared STRING variables as needed
+         For example, in Function Main: myString = "";
+*******************************************************************************************/
+INTEGER bBufferFlag; // A boolean that is used to prevent re-entry into the telnet input event.
+STRING tempInput[100];
+STRING tempHeader[50];
+STRING myID[4];
+
+/*******************************************************************************************
+  Functions
+  (Add any additional functions here)
+  Note:  Functions must be physically placed before the location in
+         the code that calls them.
+*******************************************************************************************/
+FUNCTION SendString(String output)
+{
+	telnet_output = output + LINE_DELIM;
+}
+
+
+STRING_FUNCTION MakeAprilaireMSG(String command)
+{
+	STRING out$[100];
+	MAKESTRING(out$, "%s %s", myID, command);
+	return (out$);
+}
+
+STRING_FUNCTION MakeAprilAireMode(String mode)
+{
+	String cmd$[100];
+	MAKESTRING(cmd$, "M=%s", mode);
+	return (MakeAprilaireMSG(cmd$));
+}
+
+STRING_FUNCTION MakeAprilAireFMode(STRING fmode)
+{
+ 	STRING cmd$[100];
+	MAKESTRING(cmd$, "F=%S", fmode);
+	return(MakeAprilAireMSG(cmd$));
+}
+
+// Since crestron works in integers, need to divide and round to the
+// nearest number.
+INTEGER_FUNCTION RoundDivide(INTEGER value, INTEGER divisor)
+{
+ 	INTEGER quotient$;
+	INTEGER remainder$;
+
+	quotient$ = value / divisor;
+	remainder$ = value MOD divisor;
+	
+	if(remainder$ <= (divisor / 2))
+	{
+    	return(quotient$);
+	}
+    else
+	{
+     	return(quotient$ + 1);
+	}
+}
+INTEGER_FUNCTION ConvertCtoF(INTEGER value)
+{
+	PRINT("CONVERT CTOF: %d, to %d\n", value, (RoundDivide((value * 9), 5) + 320)); 
+	return(RoundDivide((value * 9), 5) + 320);
+}
+
+INTEGER_FUNCTION ConvertFtoC(INTEGER value)
+{
+	return(RoundDivide(((value - 320) *5), 9)); 
+}
+
+STRING_FUNCTION MakeAprilAireTemperature(STRING command, Integer value)
+{
+ 	STRING cmd$[100];
+	INTEGER output$;
+	STRING scale$[1];
+	// Temperature is stored in 10ths of a degree in Fahrenheit. Aprilaire 
+	// Wants whole numbers. 
+	if(current_state.Output_Scale = "C")
+	{
+		output$ = ConvertFtoC(value);
+		scale$ = "C";
+	}
+	else
+	{
+		output$ = value;		
+		scale$ = "F";
+	}
+    output$ = RoundDivide(output$, 10);
+	MAKESTRING(cmd$, "%s=%d%s", command, output$ , scale$);
+
+	return(MakeAprilAireMSG(cmd$));
+}
+STRING_FUNCTION MakeAprilAireHumidity(STRING command, Integer value)
+{
+ 	STRING cmd$[100];
+	MAKESTRING(cmd$, "%s=%d%", command, value);
+	return(MakeAprilAireMSG(cmd$));
+}
+FUNCTION SendModeTelnet()
+{
+ 	STRING out$[100];
+	out$ = MakeAprilAireMode(current_state.Mode);
+	SendString(out$);
+}
+FUNCTION SendFModeTelnet()
+{
+ 	STRING out$[100];
+	out$ = MakeAprilAireFMode(current_state.FMode);
+	SendString(out$);
+}
+
+FUNCTION SendHeatSPTelnet()
+{
+	STRING out$[100];
+	out$ = MakeAprilAireTemperature("SH", current_state.HeatSetPoint);
+	SendString(out$);
+}
+FUNCTION SendCoolSPTelnet()
+{
+	STRING out$[100];
+	out$ = MakeAprilAireTemperature("SC", current_state.CoolSetPoint);
+	SendString(out$);
+}
+
+FUNCTION SendHumSPTelnet()
+{
+	STRING out$[100];
+	out$ = MakeAprilAireHumidity("SHUM", current_state.HumSetPoint);
+	SendString(out$);
+}
+FUNCTION SendTemperatureTelnet()
+{
+ 	STRING out$[100];
+	out$ = MakeAprilAireTemperature("T", current_state.Temperatue);
+	SendString(out$);
+}
+FUNCTION SendHumidityTelnet()
+{
+ 	STRING out$[100];
+	out$ = MakeAprilAireHumidity("HUM", current_state.Humidity);
+	SendString(out$);
+
+}
+FUNCTION SendScaleTelnet()
+{
+ 	STRING out$[100];
+	MAKESTRING(out$, "SCALE=%s", current_state.Output_Scale);
+	out$ = MakeAprilaireMSG(out$);
+	SendString(out$);
+}
+                                             
+
+STRING_FUNCTION NormalizeCommand(STRING inString)
+{
+	STRING temp$[100];
+	temp$ = UPPER(inString);
+	
+	if(RIGHT(temp$, 2) = "\x0D\x0A")
+	{
+    	return(LEFT(temp$, LEN(temp$) - 2));
+	}
+	else if(RIGHT(temp$, 1) = "\x0D")
+	{
+     	return(LEFT(temp$, LEN(temp$) -1));
+	}
+	else
+	{
+     	return(temp$);
+	}
+}
+ 
+FUNCTION HandleCommand(STRING inString)
+{
+	INTEGER isQuery$;
+	INTEGER increment$;
+	INTEGER scale_mod$;
+	INTEGER tempSP$;
+	STRING	delimiter$[1];
+	STRING 	value$[100];
+	STRING  cmd$[50];
+	STRING 	temp$[50];
+	
+	value$ = NormalizeCommand(inString);
+	
+    if(find("?", value$) > 0)
+    {
+    	isQuery$ = 1;
+    	delimiter$ = "?";
+    }
+    else
+    {
+  		isQuery$ = 0;
+		delimiter$ ="=";
+    }
+    
+    cmd$ = REMOVE(delimiter$, value$);
+    // pop off the last character of the string, which is the delimiter
+    cmd$ = LEFT(cmd$, (len(cmd$) - 1));
+    
+    cmd$ = UPPER(cmd$);
+    
+	// remove the address so we just have the command
+	temp$ = REMOVE(" ", cmd$);
+	//PRINT("COMMAND: %s, temp: %s\n", cmd$, temp$);
+    // assume not an increment command "--" or "++"
+    increment$ = 0;
+    // if it's a decrement command
+	if(find("--", cmd$) > 0)
+	{
+		increment$ = -1;
+	}	
+	else if(find("++", cmd$) > 0)
+	{
+		increment$ = 1;
+	}
+
+	// If we are changing a value, first see if the value is C or F.
+	// if it is C, multiply by 1.8 (we store degrees in F, 
+	// 1 degree C is 1.8 degree F).	 The scale part is optional, 
+	// so first we need to see if it's there at all. If not
+	// we assume the scale is whatever the current_status output scale is.
+	if((increment$ <> 0) && (find("C", value$) > 0))
+	{	
+		scale_mod$ = 18;
+	}
+	else if(find("F", value$) > 0)
+	{
+		scale_mod$ = 10;
+	}
+	else if(current_state.Output_Scale = "C")
+	{
+     	scale_mod$ = 18;
+	}
+	else
+	{
+     	scale_mod$ = 10;
+	}
+	// This is getting tricky because the first letters of commands overlap 
+	// with the shortened version of the command. Right now, we'll start 
+	// with more specific and work backwards.     
+	
+	// Set humidity setpoint
+    if(find("SHUM", cmd$) > 0)
+    {
+    	if(isQuery$ = 0)
+    	{
+    		// if it's an increment or decrement command, modify the existing value, otherwise replace it.
+    		if(increment$ <> 0)
+    		{
+    			current_state.HumSetPoint = current_state.HumSetPoint + (increment$ * AtoI(value$));
+    		}	
+			else
+			{
+             	current_state.HumSetPoint = AtoI(value$);
+			}
+    		
+    		out_hum_setpoint = current_state.HumSetPoint;
+    	}
+   		SendHumSPTelnet();
+    }
+	// Set the output scale
+	else if(find("SCALE", cmd$) > 0)
+	{	
+		if(isQuery$ = 0)
+    	{
+	
+	     	if(find(value$, "C") > 0)
+			{
+	         	current_state.Output_Scale = "C";
+			}
+			else
+			{
+	         	current_state.Output_Scale = "F";
+			}
+		}
+		SendScaleTelnet();
+	}
+
+    // Check humidity sensor
+    else if(find("HUM", cmd$) > 0)
+    {
+    	if(isQuery$ = 0)
+    	{
+    		// ignore, this cannot be assigned.	
+    	}
+    	SendHumidityTelnet();
+    }
+    // First shortened command. Need to check that the len is correct.
+    else if((find("MODE", cmd$) > 0) || ((find("M", cmd$)> 0) && (len(cmd$) = 1)))
+    {	
+    	if(isQuery$ = 0)
+    	{
+    		if((find(MODE_AUTO, value$) > 0) || 
+				((len(value$) = 1) && FIND(M_AUTO, value$) > 0))
+    		{
+    			current_state.Mode = MODE_AUTO;
+    			PULSE(PULSE_TIME, out_mode_auto);
+				out_setpoint_heat = current_state.HeatSetPoint;
+				out_setpoint_cool = current_state.CoolSetPoint;
+    		}
+    		else if((find(MODE_OFF, value$) > 0) || 
+				((len(value$) = 1) && find(M_OFF, value$) > 0))
+    		{
+    			current_state.Mode = MODE_OFF;
+    			PULSE(PULSE_TIME, out_mode_off);	
+    		}
+    		else if((find(MODE_HEAT, value$) > 0) || 
+				((len(value$) = 1) && find(M_HEAT, value$) > 0))
+    		{
+    			current_state.Mode = MODE_HEAT;
+    			PULSE(PULSE_TIME, out_mode_heat);
+				out_setpoint_heat = current_state.HeatSetPoint;
+    		}
+    		else if((find(MODE_COOL, value$) > 0) || 
+				((len(value$) = 1) && find(M_COOL, value$) > 0))
+    		{
+    			current_state.Mode = MODE_COOL;
+    			PULSE(PULSE_TIME, out_mode_cool);
+				out_setpoint_cool = current_state.CoolSetPoint;
+    		}
+    		else if((find(MODE_EHEAT, value$) > 0) || 
+				((len(value$) = 1) && find(M_EHEAT, value$) > 0))
+    		{
+    			current_state.Mode = MODE_EHEAT;
+    			PULSE(PULSE_TIME, out_mode_eheat);
+				out_setpoint_heat = current_state.HeatSetPoint;
+    		}
+			else
+			{
+             	PRINT("UNKNOWN MODE: %s, len: %d\n", value$, len(value$));
+			}
+
+
+       	}
+       	SendModeTelnet();
+
+    }
+    else if((find("FAN", cmd$) > 0) || ((find("F", cmd$)> 0) && (len(cmd$) = 1)))
+    {
+    	if(isQuery$ = 0)
+    	{
+    		if(find(MODE_ON, value$) > 0)
+    		{
+    			current_state.FMode = MODE_ON;
+				pulse(PULSE_TIME, out_fmode_on);
+    		}
+    		else
+    		{
+    			current_state.FMode = MODE_AUTO;
+				pulse(PULSE_TIME, out_fmode_auto);
+    		}
+    	}
+		else
+		{
+    		SendFModeTelnet();
+		}
+
+    }
+    else if((find("TEMP", cmd$) > 0) || ((find("T", cmd$)> 0) && (len(cmd$) = 1)))
+    {
+    	if(isQuery$ = 0)
+    	{
+    		// ignore, this can only be assigned
+       	}
+       	SendTemperatureTelnet();
+
+    }
+	// Aprilaire sends values in integers format in degrees. 
+	// We need to multiply by 10 to convert to 1/10ths of a  degree
+    else if(find("SH", cmd$)> 0)   
+   	{
+    	if(isQuery$ = 0)
+    	{
+    		if(increment$ <> 0)
+    		{	
+				current_state.HeatSetPoint = current_state.HeatSetPoint + 
+					(increment$ * AtoI(value$) * scale_mod$);			
+    		}
+    		else
+    		{
+				tempSP$ = AtoI(value$) * 10;
+				// if the incoming value is in Celsius
+				if(find("C", value$)> 0)
+				{
+                   tempSP$ = ConvertCtoF(tempSP$);
+				}
+				//PRINT("IN SH, value: %s, tempSP$=%d\n", value$, tempSP$);
+
+			    current_state.HeatSetPoint = tempSP$;
+				
+    		}
+			if(NOT in_mode_cool)		
+			{
+           		out_setpoint_heat = current_state.HeatSetPoint;
+			}
+       	}
+       	SendHeatSPTelnet();
+
+    }
+    else if(find("SC", cmd$)> 0)
+    {
+    	if(isQuery$ = 0)
+    	{
+    		if(increment$ <> 0)
+    		{
+    			current_state.CoolSetPoint = current_state.CoolSetPoint + 
+					(increment$ * AtoI(value$) * scale_mod$);			
+    		}
+    		else
+    		{
+				tempSP$ = AtoI(value$) * 10;
+				// if the incoming value is in Celsius
+				if(find("C", value$) > 0)
+				{
+                   tempSP$ = ConvertCtoF(tempSP$);
+				}
+				//PRINT("IN SC, value: %s, tempSP$=%d\n", value$, tempSP$);
+
+    			current_state.CoolSetPoint = tempSP$;
+    		}
+			
+			if(in_mode_cool)
+			{
+    			out_setpoint_cool = current_state.CoolSetPoint;
+			}
+			else
+			{
+				out_setpoint_cool = current_state.CoolSetPoint;
+			}
+
+    	}
+    	SendCoolSPTelnet();
+    }
+    // S command is for the active setpoint. We check to see if the heat is running, otherwise we assume it's for cool.
+    else if((find("S", cmd$)> 0) && (len(cmd$) =1))
+    {
+    	if(isQuery$ = 0)
+    	{
+			tempSP$ = AtoI(value$) * 10;
+			// if the incoming value is in Celsius
+			if(find("C", value$) > 0)
+			{
+                  tempSP$ = ConvertCtoF(tempSP$);
+			}
+
+    		if(in_heat_on || (current_state.Mode = MODE_HEAT))
+    		{
+    			current_state.HeatSetPoint = tempSP$;
+				out_setpoint_heat = current_state.HeatSetPoint;
+    		}
+    		else
+    		{
+    			current_state.CoolSetPoint = tempSP$ ;
+				if(in_mode_cool)
+				{
+					out_setpoint_cool = current_state.CoolSetPoint;
+				}
+				else
+				{
+                 	out_setpoint_cool = current_state.CoolSetPoint;
+				}
+    		}
+    	}
+    	
+    	if(in_heat_on || (current_state.Mode = MODE_HEAT))
+    	{
+    		sendHeatSPTelnet();
+    	}
+    	else
+    	{
+    		sendCoolSPTelnet();
+    	}
+    
+    }
+    // sp is like "S" above, but for incrementing and decrementing. 
+    else if(find("SP", cmd$) > 0)
+    {
+    	if(in_heat_on || (current_state.Mode = MODE_HEAT))
+    	{	
+    		current_state.HeatSetPoint = current_state.HeatSetPoint + 
+				(increment$ * AtoI(value$) * scale_mod$);	
+    		sendHeatSPTelnet();
+			out_setpoint_heat = current_state.HeatSetPoint;
+    	}
+    	else
+    	{
+    		current_state.CoolSetPoint = current_state.CoolSetPoint + 
+				(increment$ * AtoI(value$) * scale_mod$);	
+    		sendCoolSPTelnet();
+			if(in_mode_cool)
+			{
+				out_setpoint_cool = current_state.CoolSetPoint;
+			}
+			else
+			{
+                	out_setpoint_cool = current_state.CoolSetPoint;
+			}
+
+    	}
+    }
+	else
+	{
+     	PRINT("UNKNOWN COMMAND: %s LEN: %d\n", cmd$, len(cmd$));
+	}
+
+
+
+
+
+} 
+ 
+
+/*******************************************************************************************
+  Event Handlers
+  (Uncomment and declare additional event handlers as needed)
+*******************************************************************************************/
+PUSH in_mode_off
+{
+   	current_state.Mode = MODE_OFF;
+	SendModeTelnet();
+}
+PUSH in_mode_heat
+{
+   	current_state.Mode = MODE_HEAT;
+	SendModeTelnet();
+}
+PUSH in_mode_cool
+{
+   	current_state.Mode = MODE_COOL;
+	SendModeTelnet();
+}
+PUSH in_mode_auto
+{
+   	current_state.Mode = MODE_AUTO;
+	SendModeTelnet();
+}
+PUSH in_mode_eheat
+{
+   	current_state.Mode = MODE_EHEAT;
+	SendModeTelnet();
+}
+PUSH in_fmode_auto
+{
+    current_state.FMode = FMODE_AUTO;
+	SendFModeTelnet();
+
+}
+PUSH in_fmode_ON
+{
+    current_state.FMode = FMODE_ON;
+	SendFModeTelnet();
+}
+
+
+CHANGE in_setpoint_heat
+{
+	current_state.HeatSetPoint =  in_setpoint_heat;
+	sendHeatSPTelnet();  
+	
+}
+CHANGE in_setpoint_cool
+{
+	current_state.CoolSetPoint =  in_setpoint_cool;
+	sendCoolSPTelnet();  
+}
+CHANGE in_hum_setpoint
+{
+ 	current_state.HumSetPoint = in_hum_setpoint;
+	sendHumSPTelnet();
+}
+CHANGE in_temperature
+{
+ 	current_state.Temperatue = in_temperature;
+	sendTemperatureTelnet();
+}
+CHANGE in_humidity
+{
+ 	current_state.Humidity = in_humidity;
+	sendHumidityTelnet();
+}
+CHANGE telnet_input
+{
+	STRING search[10];
+	MAKESTRING(search, "%s ", myID);
+	if(bBufferFlag = 0)
+	{
+     	bBufferFlag = 1;
+		
+		while(find(LINE_DELIM,telnet_input) > 0)
+		{	
+			tempInput = remove(LINE_DELIM, telnet_input);			
+			// act if it's addressed to us or to all tstats
+			if((find(search, tempInput) > 0) || (find(COMMAND_ALL_A, tempInput) > 0) || 
+				(find(COMMAND_ALL_B, tempInput) > 0))
+			{
+				HandleCommand(tempInput);
+			}
+
+		}
+
+		bBufferFlag = 0;
+	}
+}
+
+/*******************************************************************************************
+  Main()
+  Uncomment and place one-time startup code here
+  (This code will get called when the system starts up)
+*******************************************************************************************/
+
+Function Main()
+{
+	bBufferFlag = 0;
+	MAKESTRING(myID, "%s%d", COMMAND_START, tstat_number);
+	// change this to switch the scale to Celsius. Or better yet, make it an input.
+	current_state.Output_Scale="F";
+	PRINT("%s is RUNNING!\n", myID);
+  
+}
+
+
